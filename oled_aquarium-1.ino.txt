@@ -1,0 +1,493 @@
+/*
+ * OLED Aquarium — Arduino Uno Edition
+ * 0.96" SSD1306 128x64 | Button on D2 | I2C: A4, A5
+ *
+ * Changes vs previous version:
+ *   - No border, no title bar — full 64px height for water
+ *   - Fish are outline-only: body arc + tail + one eye dot
+ *   - Eating animation: mouth opens wide as fish closes in,
+ *     snaps shut on contact, food disappears, fish swims on
+ *   - More breathing room between elements
+ *
+ * Libraries: Adafruit SSD1306, Adafruit GFX
+ * Wiring:
+ *   SSD1306 SDA → A4 | SCL → A5 | VCC → 3.3V/5V | GND → GND
+ *   Button      → D2 (other leg to GND, INPUT_PULLUP)
+ */
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+
+// ─── Display ───────────────────────────────────────────
+#define SCREEN_W  128
+#define SCREEN_H   64
+#define OLED_RESET  -1
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
+
+// ─── Button ────────────────────────────────────────────
+#define BTN_PIN 2
+
+// ─── World layout ──────────────────────────────────────
+// No title bar — water fills the whole screen
+#define WATER_TOP   2      // small margin so surface ripple isn't clipped
+#define SAND_Y     56      // sand starts here
+#define SAND_H      8
+
+#define MAX_BUBBLES  10
+#define MAX_PLANTS    3
+#define NUM_FISH      3
+
+// ─── Eating states ─────────────────────────────────────
+// Fish goes through these stages when food is present
+#define EAT_IDLE     0   // normal swimming
+#define EAT_CHASE    1   // heading toward food, mouth slightly open
+#define EAT_SNAP     2   // right on food, mouth wide open
+#define EAT_DONE     3   // brief pause then back to idle
+
+// ─── Lightweight RNG ───────────────────────────────────
+uint16_t rng_state = 0xACE1;
+uint16_t rng() {
+  rng_state ^= rng_state << 7;
+  rng_state ^= rng_state >> 9;
+  rng_state ^= rng_state << 8;
+  return rng_state;
+}
+int16_t rng_range(int16_t lo, int16_t hi) {
+  return lo + (rng() % (uint16_t)(hi - lo + 1));
+}
+
+// ══════════════════════════════════════════════════════
+//  STRUCTS
+// ══════════════════════════════════════════════════════
+
+struct Bubble {
+  int8_t  x, y;
+  uint8_t r;
+  uint8_t speed;
+  uint8_t timer;
+  bool    active;
+};
+
+struct Plant {
+  int8_t  x;
+  uint8_t height;
+  uint8_t phase;
+};
+
+struct Fish {
+  int8_t  x, y;
+  int8_t  vx;          // +1 right, -1 left
+  uint8_t eatState;    // EAT_IDLE / CHASE / SNAP / DONE
+  uint8_t eatTimer;    // countdown in current eat state
+  uint8_t blinkTimer;
+  bool    eyeOpen;
+  uint8_t tailPhase;
+};
+
+struct Food {
+  int8_t  x, y;
+  bool    active;
+  bool    sinking;
+};
+
+// ══════════════════════════════════════════════════════
+//  GLOBALS
+// ══════════════════════════════════════════════════════
+Bubble  bubbles[MAX_BUBBLES];
+Plant   plants[MAX_PLANTS];
+Fish    fish[NUM_FISH];
+Food    food;
+
+uint32_t frame      = 0;
+bool     btnPressed = false;
+uint8_t  swayFrame  = 0;
+
+// ══════════════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════════════
+
+void initBubble(uint8_t i) {
+  bubbles[i].x      = rng_range(4, SCREEN_W - 4);
+  bubbles[i].y      = SAND_Y - 2;
+  bubbles[i].r      = (rng() & 1) ? 1 : 2;
+  bubbles[i].speed  = 1;
+  bubbles[i].timer  = rng_range(1, 4);
+  bubbles[i].active = true;
+}
+
+void initPlants() {
+  // Spread three plants with some randomness, well away from edges
+  plants[0].x = rng_range(12, 22);
+  plants[1].x = rng_range(55, 70);
+  plants[2].x = rng_range(105, 118);
+  for (uint8_t i = 0; i < MAX_PLANTS; i++) {
+    plants[i].height = rng_range(10, 18);
+    plants[i].phase  = i * 85;
+  }
+}
+
+void initFish() {
+  for (uint8_t i = 0; i < NUM_FISH; i++) {
+    // Spread fish out vertically so they don't overlap at start
+    fish[i].x          = rng_range(20, SCREEN_W - 30);
+    fish[i].y          = WATER_TOP + 10 + i * 12;
+    fish[i].vx         = (i & 1) ? 1 : -1;
+    fish[i].eatState   = EAT_IDLE;
+    fish[i].eatTimer   = 0;
+    fish[i].blinkTimer = rng_range(40, 80);
+    fish[i].eyeOpen    = true;
+    fish[i].tailPhase  = i * 5;
+  }
+}
+
+void initFood() {
+  food.active  = false;
+  food.sinking = false;
+}
+
+// ══════════════════════════════════════════════════════
+//  UPDATE
+// ══════════════════════════════════════════════════════
+
+void updateBubbles() {
+  for (uint8_t i = 0; i < MAX_BUBBLES; i++) {
+    if (!bubbles[i].active) {
+      if (rng_range(0, 39) == 0) initBubble(i);
+      continue;
+    }
+    if (--bubbles[i].timer == 0) {
+      int8_t drift = (int8_t)(rng() % 3) - 1;
+      bubbles[i].x  = constrain(bubbles[i].x + drift, 2, SCREEN_W - 3);
+      bubbles[i].y -= bubbles[i].speed;
+      bubbles[i].timer = rng_range(1, 4);
+    }
+    if (bubbles[i].y <= WATER_TOP + 1) bubbles[i].active = false;
+  }
+}
+
+// Triangle-wave sway — returns pixel offset for a stem segment
+int8_t swayOffset(uint8_t plantIdx, uint8_t heightFrac) {
+  uint16_t angle = (swayFrame + plants[plantIdx].phase) & 0xFF;
+  int8_t raw;
+  if (angle < 64)       raw =  angle;
+  else if (angle < 192) raw =  128 - (int8_t)angle;
+  else                  raw = (int8_t)angle - 256;
+  return (int8_t)(((int16_t)raw * heightFrac) >> 9);
+}
+
+void dropFood() {
+  if (food.active) return;
+  food.x       = rng_range(20, SCREEN_W - 20);
+  food.y       = WATER_TOP + 2;
+  food.active  = true;
+  food.sinking = true;
+
+  // One random fish chases it; others go idle
+  uint8_t chosen = rng_range(0, NUM_FISH - 1);
+  for (uint8_t i = 0; i < NUM_FISH; i++) {
+    fish[i].eatState = (i == chosen) ? EAT_CHASE : EAT_IDLE;
+    fish[i].eatTimer = 0;
+  }
+}
+
+void updateFood() {
+  if (!food.active) return;
+  if (food.sinking) {
+    // Sink to mid-water
+    int8_t targetY = (WATER_TOP + SAND_Y) / 2;
+    if (food.y < targetY) food.y++;
+    else                  food.sinking = false;
+  }
+}
+
+void updateFish() {
+  for (uint8_t i = 0; i < NUM_FISH; i++) {
+    fish[i].tailPhase++;
+
+    // Blink
+    if (fish[i].blinkTimer > 0) fish[i].blinkTimer--;
+    if (fish[i].blinkTimer == 0) {
+      fish[i].eyeOpen    = !fish[i].eyeOpen;
+      fish[i].blinkTimer = fish[i].eyeOpen ? rng_range(50, 90) : rng_range(2, 5);
+    }
+
+    // ── Eating state machine ─────────────────────────
+    if (fish[i].eatState == EAT_CHASE && food.active) {
+      // Move toward food position
+      int8_t dx = food.x - fish[i].x;
+      int8_t dy = food.y - fish[i].y;
+
+      if (dx > 0)      { fish[i].x++; fish[i].vx =  1; }
+      else if (dx < 0) { fish[i].x--; fish[i].vx = -1; }
+      if (dy > 0)       fish[i].y++;
+      else if (dy < 0)  fish[i].y--;
+
+      // Close enough? Enter SNAP
+      if (abs(dx) <= 3 && abs(dy) <= 3) {
+        fish[i].eatState = EAT_SNAP;
+        fish[i].eatTimer = 10;   // hold snap pose for 10 frames
+      }
+
+    } else if (fish[i].eatState == EAT_SNAP) {
+      // Stay put, mouth wide open
+      if (fish[i].eatTimer > 0) {
+        fish[i].eatTimer--;
+      } else {
+        // Food eaten!
+        food.active      = false;
+        fish[i].eatState = EAT_DONE;
+        fish[i].eatTimer = 8;    // tiny pause before resuming swim
+      }
+
+    } else if (fish[i].eatState == EAT_DONE) {
+      // Brief idle pause then back to normal
+      if (fish[i].eatTimer > 0) fish[i].eatTimer--;
+      else                      fish[i].eatState = EAT_IDLE;
+
+    } else {
+      // ── Normal swimming ──────────────────────────
+      if (rng_range(0, 79) == 0) fish[i].y += rng_range(-2, 2);
+
+      fish[i].x += fish[i].vx;
+
+      if (fish[i].x >= SCREEN_W - 10) { fish[i].x = SCREEN_W - 10; fish[i].vx = -1; }
+      if (fish[i].x <=  8)            { fish[i].x =  8;             fish[i].vx =  1; }
+    }
+
+    // Clamp y inside water, away from sand
+    fish[i].y = constrain(fish[i].y, WATER_TOP + 5, SAND_Y - 9);
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  DRAW
+// ══════════════════════════════════════════════════════
+
+void drawWaterSurface() {
+  for (uint8_t x = 0; x < SCREEN_W; x += 2) {
+    uint8_t angle = (x * 3 + (uint8_t)(frame >> 1)) & 0xFF;
+    int8_t  wy    = WATER_TOP + ((angle < 128) ? 0 : 1);
+    display.drawPixel(x,     wy, WHITE);
+    display.drawPixel(x + 1, wy, WHITE);
+  }
+}
+
+void drawSand() {
+  display.fillRect(0, SAND_Y, SCREEN_W, SAND_H, WHITE);
+  // subtle texture
+  for (uint8_t x = 0; x < SCREEN_W; x += 4) {
+    display.drawPixel(x,     SAND_Y,     BLACK);
+    display.drawPixel(x + 2, SAND_Y + 1, BLACK);
+  }
+  // pebbles — fewer, more spread out
+  display.fillRect(14,  SAND_Y + 2, 3, 2, BLACK);
+  display.fillRect(50,  SAND_Y + 3, 4, 2, BLACK);
+  display.fillRect(88,  SAND_Y + 2, 3, 2, BLACK);
+  display.fillRect(115, SAND_Y + 3, 2, 2, BLACK);
+}
+
+void drawPlants() {
+  for (uint8_t p = 0; p < MAX_PLANTS; p++) {
+    int8_t baseX = plants[p].x;
+    uint8_t h    = plants[p].height;
+    int8_t  prevX = baseX;
+
+    for (uint8_t seg = 0; seg < h; seg++) {
+      uint8_t frac  = (uint8_t)((uint16_t)seg * 255 / h);
+      int8_t  sway  = swayOffset(p, frac);
+      int8_t  curX  = baseX + sway;
+      int8_t  curY  = SAND_Y - seg;
+      display.drawLine(prevX, curY + 1, curX, curY, WHITE);
+      prevX = curX;
+
+      if (seg > 4 && seg % 5 == 0) {
+        display.drawLine(curX, curY, curX - 3, curY - 3, WHITE);
+        display.drawLine(curX, curY, curX + 3, curY - 3, WHITE);
+      }
+    }
+    // tip dot
+    int8_t tipX = baseX + swayOffset(p, 255);
+    display.fillCircle(tipX, SAND_Y - h, 2, WHITE);
+  }
+}
+
+void drawBubbles() {
+  for (uint8_t i = 0; i < MAX_BUBBLES; i++) {
+    if (!bubbles[i].active) continue;
+    if (bubbles[i].r == 1) {
+      display.drawPixel(bubbles[i].x, bubbles[i].y, WHITE);
+    } else {
+      display.drawCircle(bubbles[i].x, bubbles[i].y, 2, WHITE);
+      display.drawPixel(bubbles[i].x - 1, bubbles[i].y - 1, WHITE);
+    }
+  }
+}
+
+// ── Outline-only fish with eating animation ───────────
+//
+//  Fish shape (facing right, ~12px wide):
+//
+//    tail   body arc    head/mouth
+//    \   ___________
+//     \ /            \
+//      |      o       )  ← closed mouth
+//     / \____________/
+//    /
+//
+//  When mouth opens (EAT_CHASE near food, EAT_SNAP):
+//    head becomes:   )
+//                  (     ← gap = open mouth
+//
+void drawFish(uint8_t i) {
+  int8_t  fx  = fish[i].x;
+  int8_t  fy  = fish[i].y;
+  int8_t  dir = fish[i].vx;   // +1 right, -1 left
+  uint8_t st  = fish[i].eatState;
+
+  // Determine mouth openness
+  // 0 = closed, 1 = slightly open (chasing), 2 = wide open (snap)
+  uint8_t mouthOpen = 0;
+  if (st == EAT_CHASE) {
+    // Open slightly when chasing
+    mouthOpen = 1;
+  } else if (st == EAT_SNAP) {
+    // Wide open for snap frames
+    mouthOpen = 2;
+  }
+
+  // Tail wag
+  uint8_t ph   = fish[i].tailPhase & 0x0F;
+  int8_t  twag = (ph < 8) ? 1 : -1;
+
+  // ── Body outline: top arc + bottom arc ──────────────
+  // We draw two arcs as line segments approximating an oval
+  // Body spans fx-5 to fx+4 (10px wide), fy-3 to fy+3 (6px tall)
+  // Top arc (3 segments)
+  display.drawLine(fx - 4, fy,     fx - 2, fy - 3, WHITE);
+  display.drawLine(fx - 2, fy - 3, fx + 2, fy - 3, WHITE);
+  display.drawLine(fx + 2, fy - 3, fx + 4, fy,     WHITE);
+  // Bottom arc
+  display.drawLine(fx - 4, fy,     fx - 2, fy + 3, WHITE);
+  display.drawLine(fx - 2, fy + 3, fx + 2, fy + 3, WHITE);
+  display.drawLine(fx + 2, fy + 3, fx + 4, fy,     WHITE);
+
+  // ── Tail (forked, on the trailing side) ─────────────
+  if (dir == 1) {
+    // Moving right → tail on left
+    display.drawLine(fx - 4, fy, fx - 8, fy - 3 + twag, WHITE);
+    display.drawLine(fx - 4, fy, fx - 8, fy + 3 - twag, WHITE);
+  } else {
+    // Moving left → tail on right
+    display.drawLine(fx + 4, fy, fx + 8, fy - 3 + twag, WHITE);
+    display.drawLine(fx + 4, fy, fx + 8, fy + 3 - twag, WHITE);
+  }
+
+  // ── Mouth ────────────────────────────────────────────
+  // Head tip is at fx + dir*4
+  int8_t mouthX = fx + dir * 4;
+
+  if (mouthOpen == 0) {
+    // Closed — connect top and bottom arcs with a dot / tiny line
+    display.drawPixel(mouthX, fy, WHITE);
+
+  } else if (mouthOpen == 1) {
+    // Slightly open — small gap: top jaw one pixel above, bottom one below
+    display.drawPixel(mouthX, fy - 1, WHITE);  // top jaw tip
+    display.drawPixel(mouthX, fy + 1, WHITE);  // bottom jaw tip
+    // small gap in between = open mouth
+
+  } else {
+    // Wide open snap — angle the jaws outward
+    display.drawLine(mouthX, fy - 1, mouthX + dir, fy - 3, WHITE);  // upper jaw
+    display.drawLine(mouthX, fy + 1, mouthX + dir, fy + 3, WHITE);  // lower jaw
+  }
+
+  // ── Eye — single pixel, on the leading side ──────────
+  int8_t eyeX = fx + dir * 2;
+  int8_t eyeY = fy - 1;
+  if (fish[i].eyeOpen) {
+    display.drawPixel(eyeX, eyeY, WHITE);
+  }
+  // (closed eye = no pixel drawn = invisible, keeps it minimal)
+
+  // ── Dorsal fin — tiny notch on top ──────────────────
+  display.drawPixel(fx, fy - 3, WHITE);
+  display.drawPixel(fx, fy - 4, WHITE);
+}
+
+void drawFood() {
+  if (!food.active) return;
+  // Tiny 2×2 pellet
+  display.fillRect(food.x - 1, food.y - 1, 3, 3, WHITE);
+  display.drawPixel(food.x, food.y, BLACK);
+}
+
+// ══════════════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════════════
+void setup() {
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while (true);  // halt if OLED not found
+  }
+
+  // Brief splash
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(28, 24);
+  display.print(F("Aquarium"));
+  display.setCursor(10, 38);
+  display.print(F("Btn = drop food"));
+  display.display();
+  delay(1600);
+
+  rng_state = (uint16_t)millis() ^ 0x5A3C;
+
+  // Pre-spawn a couple of bubbles so screen isn't empty at start
+  initBubble(0);
+  initBubble(1);
+  initPlants();
+  initFish();
+  initFood();
+}
+
+// ══════════════════════════════════════════════════════
+//  LOOP
+// ══════════════════════════════════════════════════════
+void loop() {
+  frame++;
+  swayFrame++;
+
+  // ── Input ──────────────────────────────────────────
+  if (digitalRead(BTN_PIN) == LOW) {
+    if (!btnPressed) {
+      btnPressed = true;
+      dropFood();
+    }
+  } else {
+    btnPressed = false;
+  }
+
+  // ── Physics ────────────────────────────────────────
+  updateBubbles();
+  updateFood();
+  updateFish();
+
+  // ── Render ─────────────────────────────────────────
+  display.clearDisplay();
+
+  drawWaterSurface();
+  drawSand();
+  drawPlants();
+  drawBubbles();
+  drawFood();
+  for (uint8_t i = 0; i < NUM_FISH; i++) drawFish(i);
+
+  display.display();
+
+  // ~25 FPS
+  delay(40);
+}
